@@ -1,0 +1,22 @@
+[
+  {
+    "id": "P101",
+    "name": "Floral Lawn Suit",
+    "season": "Summer",
+    "category": "Unstitched",
+    "pieces": "3-piece",
+    "fabric": "Lawn",
+    "sizes": ["Medium", "Large", "XL"],
+    "price": 4500.0
+  },
+  {
+    "id": "P102",
+    "name": "Velvet Embroidered Kurti",
+    "season": "Winter",
+    "category": "Stitched",
+    "pieces": "1-piece",
+    "fabric": "Velvet",
+    "sizes": ["Medium", "Large", "XL"],
+    "price": 6800.0
+  }
+]
