@@ -6,7 +6,7 @@ def main():
     user = None
     cart = CartService()
 
-    # Onboarding Flow
+    
     while not user:
         print("\n--- Welcome Menu ---")
         print("1. Login")
@@ -36,7 +36,7 @@ def main():
             print("Goodbye!")
             sys.exit()
 
-    # Main Store Loop
+    
     while True:
         print(f"\n--- Main Menu (Logged in as {user.username}) ---")
         print("1. Browse Catalog")
