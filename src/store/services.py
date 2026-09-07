@@ -1,75 +1,71 @@
-import json
-import os
+import hashlib
 from typing import List, Optional
-from .models import Product, CartItem, User
-from .logger import logger
-from .config import PRODUCTS_FILE, USERS_FILE, DELIVERY_CHARGES, CURRENCY, DEFAULT_PAYMENT_METHOD
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+from .models import UserModel, ProductModel, OrderModel, OrderItemModel, OrderStatus, UserRole
+from .exceptions import AuthenticationError, CartError
 
 class AuthService:
     @staticmethod
-    def _load_users() -> list:
-        if not os.path.exists(USERS_FILE):
-            return []
-        with open(USERS_FILE, "r") as f:
-            return json.load(f)
+    def _hash_password(password: str) -> str:
+        return hashlib.sha256(password.encode()).hexdigest()
 
     @classmethod
-    def signup(cls, username: str, password: str) -> User:
-        users = cls._load_users()
-        if any(u["username"] == username for u in users):
-            logger.warning(f"Failed signup attempt: Username '{username}' already exists.")
-            raise ValueError("Username already exists.")
-        new_user = {"username": username, "password": password, "phone": "", "address": ""}
-        users.append(new_user)
-        with open(USERS_FILE, "w") as f:
-            json.dump(users, f, indent=2)
-        logger.info(f"New user registered: {username}")
-        return User(username, password)
+    async def login(cls, session: AsyncSession, username: str, password: str) -> UserModel:
+        hashed = cls._hash_password(password)
+        # Use UserModel.password instead of UserModel.password_hash
+        stmt = select(UserModel).where(UserModel.username == username, UserModel.password == hashed)
+        result = await session.execute(stmt)
+        user = result.scalar_one_or_none()
+        if not user:
+            raise AuthenticationError("Invalid username or password.")
+        return user
 
     @classmethod
-    def login(cls, username: str, password: str) -> Optional[User]:
-        users = cls._load_users()
-        for u in users:
-            if u["username"] == username and u["password"] == password:
-                logger.info(f"User logged in: {username}")
-                return User(u["username"], u["password"], u.get("phone", ""), u.get("address", ""))
-        logger.warning(f"Failed login attempt for username: {username}")
-        return None
+    async def signup(cls, session: AsyncSession, username: str, password: str, role: UserRole = UserRole.CUSTOMER) -> UserModel:
+        stmt = select(UserModel).where(UserModel.username == username)
+        result = await session.execute(stmt)
+        if result.scalar_one_or_none():
+            raise AuthenticationError("Username already exists.")
 
+        new_user = UserModel(
+            username=username,
+            password=cls._hash_password(password),  # Use password field
+            role=role
+        )
+        session.add(new_user)
+        await session.commit()
+        await session.refresh(new_user)
+        return new_user
+    
 class CatalogService:
     @staticmethod
-    def get_products() -> List[Product]:
-        if not os.path.exists(PRODUCTS_FILE):
-            return []
-        with open(PRODUCTS_FILE, "r") as f:
-            data = json.load(f)
-        return [Product(**p) for p in data]
+    async def filter_products(session: AsyncSession, season: str, category: str) -> List[ProductModel]:
+        stmt = select(ProductModel).where(
+            ProductModel.category.ilike(f"%{category}%")
+        )
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
 
-    @classmethod
-    def filter_products(cls, season: str, category: str) -> List[Product]:
-        logger.info(f"Catalog filtered by Season: {season}, Category: {category}")
-        return [
-            p for p in cls.get_products() 
-            if p.season.lower() == season.lower() and p.category.lower() == category.lower()
-        ]
+class CartItem:
+    def __init__(self, product: ProductModel, quantity: int):
+        self.product = product
+        self.quantity = quantity
+
+    @property
+    def total_price(self) -> float:
+        return self.product.price * self.quantity
 
 class CartService:
     def __init__(self):
         self.items: List[CartItem] = []
 
-    def add_item(self, product: Product, size: str, quantity: int):
-        for item in self.items:
-            if item.product.id == product.id and item.selected_size == size:
-                item.quantity += quantity
-                logger.info(f"Updated quantity in cart: {product.name} ({size}) x{item.quantity}")
-                return
-        self.items.append(CartItem(product, size, quantity))
-        logger.info(f"Added to cart: {product.name} ({size}) x{quantity}")
+    def add_item(self, product: ProductModel, quantity: int):
+        self.items.append(CartItem(product, quantity))
 
     def remove_item(self, index: int):
         if 0 <= index < len(self.items):
-            removed = self.items.pop(index)
-            logger.info(f"Removed from cart: {removed.product.name}")
+            self.items.pop(index)
 
     def get_subtotal(self) -> float:
         return sum(item.total_price for item in self.items)
@@ -78,19 +74,69 @@ class CartService:
         self.items.clear()
 
 class CheckoutService:
-    @classmethod
-    def process_checkout(cls, cart: CartService, user: User, phone: str, address: str):
-        subtotal = cart.get_subtotal()
-        total = subtotal + DELIVERY_CHARGES
-        
-        print("\n--- Order Summary ---")
-        print(f"Customer: {user.username}")
-        print(f"Delivery Address: {address} | Phone: {phone}")
-        print(f"Subtotal: {CURRENCY} {subtotal:.2f}")
-        print(f"Delivery Charges: {CURRENCY} {DELIVERY_CHARGES:.2f}")
-        print(f"Grand Total: {CURRENCY} {total:.2f}")
-        print(f"Payment Method: {DEFAULT_PAYMENT_METHOD}")
-        print("\nOrder placed successfully!")
-        
-        logger.info(f"Order completed for {user.username}. Total Amount: {CURRENCY} {total:.2f}")
+    @staticmethod
+    async def process_checkout(session: AsyncSession, cart: CartService, user: UserModel, phone: str, address: str) -> OrderModel:
+        if not cart.items:
+            raise CartError("Cart is empty.")
+
+        user.phone = phone
+        user.address = address
+
+        order = OrderModel(
+            user_id=user.id,
+            total_amount=cart.get_subtotal(),
+            status=OrderStatus.PENDING
+        )
+        session.add(order)
+        await session.flush()
+
+        for item in cart.items:
+            if item.product.stock < item.quantity:
+                raise CartError(f"Insufficient stock for {item.product.name}.")
+            item.product.stock -= item.quantity
+            order_item = OrderItemModel(
+                order_id=order.id,
+                product_id=item.product.id,
+                quantity=item.quantity,
+                unit_price=item.product.price
+            )
+            session.add(order_item)
+
+        await session.commit()
+        await session.refresh(order)
         cart.clear()
+        return order
+
+class OrderService:
+    @staticmethod
+    async def get_user_orders(session: AsyncSession, user: UserModel) -> List[OrderModel]:
+        stmt = select(OrderModel).where(OrderModel.user_id == user.id)
+        result = await session.execute(stmt)
+        return list(result.scalars().all())
+
+    @staticmethod
+    async def get_order_by_id(session: AsyncSession, order_id: int, user: UserModel) -> Optional[OrderModel]:
+        stmt = select(OrderModel).where(OrderModel.id == order_id)
+        result = await session.execute(stmt)
+        order = result.scalar_one_or_none()
+
+        if order and (user.role == UserRole.ADMIN or order.user_id == user.id):
+            return order
+        return None
+
+    @staticmethod
+    async def admin_update_order_status(session: AsyncSession, admin: UserModel, order_id: int, new_status: OrderStatus) -> OrderModel:
+        if admin.role != UserRole.ADMIN:
+            raise AuthenticationError("Only administrators can update order statuses.")
+
+        stmt = select(OrderModel).where(OrderModel.id == order_id)
+        result = await session.execute(stmt)
+        order = result.scalar_one_or_none()
+
+        if not order:
+            raise ValueError(f"Order #{order_id} not found.")
+
+        order.status = new_status
+        await session.commit()
+        await session.refresh(order)
+        return order
